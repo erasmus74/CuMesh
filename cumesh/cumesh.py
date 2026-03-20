@@ -403,6 +403,123 @@ class CuMesh:
         """
         return self.cu_mesh.read_atlas_charts()
     
+    @staticmethod
+    def _gpu_uv_parameterize(new_vertices, num_charts, chart_vmap, chart_faces,
+                              chart_vertex_offset, chart_face_offset,
+                              padding_pixels=1, resolution=1024, verbose=False):
+        """
+        GPU-based UV parameterization using PCA projection and shelf packing.
+        Replaces xatlas for ROCm/HIP where xatlas (CPU) is too slow.
+        """
+        device = new_vertices.device
+        chart_vertices = new_vertices[chart_vmap]
+        total_verts = chart_vmap.shape[0]
+
+        all_uvs = torch.zeros((total_verts, 2), dtype=torch.float32, device=device)
+        # Track each chart's UV bounding box size for packing
+        chart_widths = []
+        chart_heights = []
+
+        for i in tqdm(range(num_charts), desc="GPU UV parameterize", disable=not verbose):
+            v_start = chart_vertex_offset[i].item()
+            v_end = chart_vertex_offset[i + 1].item()
+            n_verts = v_end - v_start
+
+            if n_verts < 3:
+                chart_widths.append(1e-6)
+                chart_heights.append(1e-6)
+                continue
+
+            verts = chart_vertices[v_start:v_end]
+
+            # PCA: project onto the two directions of greatest variance
+            center = verts.mean(dim=0)
+            centered = verts - center
+            cov = centered.T @ centered
+            eigenvalues, eigenvectors = torch.linalg.eigh(cov)
+            # eigh returns ascending order; last two are largest
+            axis1 = eigenvectors[:, -1]
+            axis2 = eigenvectors[:, -2]
+
+            u = centered @ axis1
+            v = centered @ axis2
+            uvs = torch.stack([u, v], dim=1)
+
+            # Normalize to [0, 1]
+            uv_min = uvs.min(dim=0).values
+            uv_max = uvs.max(dim=0).values
+            uv_range = (uv_max - uv_min).clamp(min=1e-8)
+            uvs = (uvs - uv_min) / uv_range
+
+            all_uvs[v_start:v_end] = uvs
+            # Store aspect ratio for packing (proportional to 3D extent)
+            chart_widths.append(uv_range[0].item())
+            chart_heights.append(uv_range[1].item())
+
+        # --- Shelf-based atlas packing ---
+        uv_pad = max(padding_pixels / resolution, 0.001)
+
+        # Sort charts by height descending for better shelf packing
+        chart_order = sorted(range(num_charts), key=lambda i: -chart_heights[i])
+
+        # Normalize chart sizes so total area roughly fits in a unit square
+        total_area = sum(w * h for w, h in zip(chart_widths, chart_heights))
+        if total_area < 1e-12:
+            total_area = 1.0
+        scale_factor = 0.9 / math.sqrt(total_area)  # ~90% fill target
+
+        scaled_w = [chart_widths[i] * scale_factor for i in range(num_charts)]
+        scaled_h = [chart_heights[i] * scale_factor for i in range(num_charts)]
+
+        # Pack with shelves
+        placements = [None] * num_charts  # (offset_x, offset_y, scale_x, scale_y)
+        shelf_y = 0.0
+        shelf_x = 0.0
+        shelf_height = 0.0
+        atlas_width = 0.0
+        atlas_height = 0.0
+
+        for idx in chart_order:
+            w = scaled_w[idx] + 2 * uv_pad
+            h = scaled_h[idx] + 2 * uv_pad
+
+            # Start new shelf if this chart doesn't fit
+            if shelf_x + w > 1.0 and shelf_x > 0:
+                shelf_y += shelf_height
+                shelf_x = 0.0
+                shelf_height = 0.0
+
+            placements[idx] = (shelf_x + uv_pad, shelf_y + uv_pad, scaled_w[idx], scaled_h[idx])
+            shelf_x += w
+            shelf_height = max(shelf_height, h)
+            atlas_width = max(atlas_width, shelf_x)
+            atlas_height = max(atlas_height, shelf_y + shelf_height)
+
+        # Normalize so everything fits in [0, 1]
+        if atlas_height > 1e-8:
+            y_scale = 1.0 / atlas_height
+        else:
+            y_scale = 1.0
+        if atlas_width > 1e-8:
+            x_scale = 1.0 / atlas_width
+        else:
+            x_scale = 1.0
+        norm_scale = min(x_scale, y_scale)
+
+        # Apply placements to UVs
+        for i in range(num_charts):
+            v_start = chart_vertex_offset[i].item()
+            v_end = chart_vertex_offset[i + 1].item()
+            if v_end <= v_start:
+                continue
+
+            ox, oy, sw, sh = placements[i]
+            scale = torch.tensor([sw * norm_scale, sh * norm_scale], device=device)
+            offset = torch.tensor([ox * norm_scale, oy * norm_scale], device=device)
+            all_uvs[v_start:v_end] = all_uvs[v_start:v_end] * scale + offset
+
+        return chart_vertices, chart_faces, all_uvs, chart_vmap
+
     def uv_unwrap(
         self,
         compute_charts_kwargs: dict={},
@@ -413,14 +530,14 @@ class CuMesh:
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Parameterize the mesh using the accelerated mesh clustering and Xatlas
-        
+
         Args:
             compute_charts_kwargs: a dictionary of options for the compute_charts function.
             xatlas_compute_charts_kwargs: a dictionary of options for the xatlas compute_charts function.
             xatlas_pack_charts_kwargs: a dictionary of options for the xatlas pack_charts function.
             return_vmaps: whether to return the vertex maps.
             verbose: whether to print the progress.
-            
+
         Returns:
             A tuple of:
                 - the vertex positions
@@ -428,52 +545,72 @@ class CuMesh:
                 - the uv coordinates
                 - (optional) the map from the new vertex indices to the old vertex indices
         """
-        xatlas_compute_charts_kwargs['verbose'] = verbose
-        xatlas_pack_charts_kwargs['verbose'] = verbose
-        
         self.remove_degenerate_faces()
-        
-        # 1. Fast mesh clustering
+
+        # 1. Fast GPU mesh clustering
         self.compute_charts(**compute_charts_kwargs)
         new_vertices, new_faces = self.read()
         num_charts, charts_id, chart_vmap, chart_faces, chart_vertex_offset, chart_face_offset = self.read_atlas_charts()
-        chart_vertices = new_vertices[chart_vmap].cpu()
-        chart_faces = chart_faces.cpu()
-        chart_vertex_offset = chart_vertex_offset.cpu()
-        chart_face_offset = chart_face_offset.cpu()
-        chart_vmap = chart_vmap.cpu()
+
         if verbose:
             print(f"Get {num_charts} clusters after fast clustering")
-        
-        # 2. Xatlas packing
-        xatlas = Atlas()
-        chart_vmaps = []
-        for i in tqdm(range(num_charts), desc="Adding clusters to xatlas", disable=not verbose):
-            chart_faces_i = chart_faces[chart_face_offset[i]:chart_face_offset[i+1]] - chart_vertex_offset[i]
-            chart_vertices_i = chart_vertices[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
-            chart_vmap_i = chart_vmap[chart_vertex_offset[i]:chart_vertex_offset[i+1]]
-            chart_vmaps.append(chart_vmap_i)
-            xatlas.add_mesh(chart_vertices_i, chart_faces_i)
-        xatlas.compute_charts(**xatlas_compute_charts_kwargs)
-        xatlas.pack_charts(**xatlas_pack_charts_kwargs)
-        vmaps = []
-        faces = []
-        uvs = []
-        cnt = 0
-        for i in tqdm(range(num_charts), desc="Gathering results from xatlas", disable=not verbose):
-            vmap, x_faces, x_uvs = xatlas.get_mesh(i)
-            vmaps.append(chart_vmaps[i][vmap])
-            faces.append(x_faces + cnt)
-            uvs.append(x_uvs)
-            cnt += vmap.shape[0]
-        vmaps = torch.cat(vmaps, dim=0)
-        vertices = new_vertices.cpu()[vmaps]
-        faces = torch.cat(faces, dim=0)
-        uvs = torch.cat(uvs, dim=0)
-        
+
+        # 2. UV parameterization
+        use_gpu = bool(getattr(torch.version, 'hip', False))
+
+        if use_gpu:
+            # GPU-based PCA projection + shelf packing (fast, ROCm-friendly)
+            if verbose:
+                print("Using GPU UV parameterization (ROCm)")
+            pack_res = xatlas_pack_charts_kwargs.get('resolution', 1024)
+            pack_pad = xatlas_pack_charts_kwargs.get('padding', 1)
+            vertices, faces, uvs, vmaps = self._gpu_uv_parameterize(
+                new_vertices, num_charts, chart_vmap, chart_faces,
+                chart_vertex_offset, chart_face_offset,
+                padding_pixels=pack_pad, resolution=pack_res, verbose=verbose,
+            )
+            vertices = vertices.cpu()
+            faces = faces.cpu()
+            uvs = uvs.cpu()
+            vmaps = vmaps.cpu()
+        else:
+            # Original xatlas path (CPU, for CUDA systems)
+            xatlas_compute_charts_kwargs['verbose'] = verbose
+            xatlas_pack_charts_kwargs['verbose'] = verbose
+            chart_vertices = new_vertices[chart_vmap].cpu()
+            chart_faces_cpu = chart_faces.cpu()
+            chart_vertex_offset_cpu = chart_vertex_offset.cpu()
+            chart_face_offset_cpu = chart_face_offset.cpu()
+            chart_vmap_cpu = chart_vmap.cpu()
+
+            xatlas = Atlas()
+            chart_vmaps = []
+            for i in tqdm(range(num_charts), desc="Adding clusters to xatlas", disable=not verbose):
+                chart_faces_i = chart_faces_cpu[chart_face_offset_cpu[i]:chart_face_offset_cpu[i+1]] - chart_vertex_offset_cpu[i]
+                chart_vertices_i = chart_vertices[chart_vertex_offset_cpu[i]:chart_vertex_offset_cpu[i+1]]
+                chart_vmap_i = chart_vmap_cpu[chart_vertex_offset_cpu[i]:chart_vertex_offset_cpu[i+1]]
+                chart_vmaps.append(chart_vmap_i)
+                xatlas.add_mesh(chart_vertices_i, chart_faces_i)
+            xatlas.compute_charts(**xatlas_compute_charts_kwargs)
+            xatlas.pack_charts(**xatlas_pack_charts_kwargs)
+            vmaps_list = []
+            faces_list = []
+            uvs_list = []
+            cnt = 0
+            for i in tqdm(range(num_charts), desc="Gathering results from xatlas", disable=not verbose):
+                vmap, x_faces, x_uvs = xatlas.get_mesh(i)
+                vmaps_list.append(chart_vmaps[i][vmap])
+                faces_list.append(x_faces + cnt)
+                uvs_list.append(x_uvs)
+                cnt += vmap.shape[0]
+            vmaps = torch.cat(vmaps_list, dim=0)
+            vertices = new_vertices.cpu()[vmaps]
+            faces = torch.cat(faces_list, dim=0)
+            uvs = torch.cat(uvs_list, dim=0)
+
         out = [vertices, faces, uvs]
         if return_vmaps:
             out.append(vmaps)
-        
+
         return tuple(out)
             
