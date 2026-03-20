@@ -138,7 +138,7 @@ ext_modules = [
     ),
 
     # ===============================
-    # xatlas (CPU only)
+    # xatlas (CPU only, multithreading disabled to avoid deadlocks on ROCm)
     # ===============================
     CUDAExtension(
         name="cumesh._cumesh_xatlas",
@@ -147,7 +147,7 @@ ext_modules = [
             "third_party/xatlas/binding.cpp",
         ],
         extra_compile_args={
-            "cxx": cxx_flags,
+            "cxx": cxx_flags + (["-DXA_MULTITHREADED=0"] if IS_HIP else []),
         },
     ),
 ]
