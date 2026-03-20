@@ -3,6 +3,9 @@
 #include "shared.h"
 #include <cub/cub.cuh>
 
+#ifdef __HIP_PLATFORM_AMD__
+#include <rocprim/types/tuple.hpp>
+#endif
 
 namespace cumesh {
 
@@ -227,6 +230,15 @@ static __global__ void select_first_in_each_group_kernel(
 }
 
 
+#ifdef __HIP_PLATFORM_AMD__
+struct int3_decomposer
+{
+    __host__ __device__ ::rocprim::tuple<int&, int&, int&> operator()(int3& key) const
+    {
+        return ::rocprim::tie(key.x, key.y, key.z);
+    }
+};
+#else
 struct int3_decomposer
 {
     __host__ __device__ ::cuda::std::tuple<int&, int&, int&> operator()(int3& key) const
@@ -234,6 +246,7 @@ struct int3_decomposer
         return {key.x, key.y, key.z};
     }
 };
+#endif
 
 
 void CuMesh::remove_duplicate_faces() {

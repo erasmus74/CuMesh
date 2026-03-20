@@ -1,3 +1,8 @@
+# PyTorch hipify auto-generated files (build artifacts)
+src/*.hip
+src/**/*.hip
+src/*_hip.*
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

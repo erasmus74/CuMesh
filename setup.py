@@ -30,8 +30,8 @@ if IS_WINDOWS:
     cxx_flags += [
         "/O2",
         "/std:c++17",
-        "/EHsc", 
-        "/permissive-", 
+        "/EHsc",
+        "/permissive-",
         "/Zc:__cplusplus"
     ]
     nvcc_flags += [
@@ -40,30 +40,47 @@ if IS_WINDOWS:
         "--expt-relaxed-constexpr",
         "--extended-lambda",
         "-Xcompiler=/std:c++17",
-        "-Xcompiler=/EHsc", 
-        "-Xcompiler=/permissive-", 
+        "-Xcompiler=/EHsc",
+        "-Xcompiler=/permissive-",
         "-Xcompiler=/Zc:__cplusplus"
     ]
 else:
     cxx_flags += [
-        "-O3", 
+        "-O3",
         "-std=c++17"
-    ]    
+    ]
     nvcc_flags += [
         "-O3",
         "-std=c++17"
     ]
 
 # -------------------------------------------------
-# CUDA / ROCm specific
+# CUDA / ROCm specific include directories
 # -------------------------------------------------
+compat_include_dirs = []
+
 if IS_HIP:
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     nvcc_flags += [f"--offload-arch={arch}" for arch in archs]
+    # Add compat headers directory FIRST so cuda.h/cub/cub.cuh resolve to HIP wrappers
+    compat_include_dirs = [os.path.join(ROOT, "compat")]
 else:
     # CUDA only
     if IS_WINDOWS:
         nvcc_flags += ["-allow-unsupported-compiler"]
+
+# -------------------------------------------------
+# cubvh extra flags (CUDA-only flags removed for HIP)
+# -------------------------------------------------
+if IS_HIP:
+    cubvh_extra_nvcc_flags = []
+else:
+    cubvh_extra_nvcc_flags = [
+        "--extended-lambda",
+        "-U__CUDA_NO_HALF_OPERATORS__",
+        "-U__CUDA_NO_HALF_CONVERSIONS__",
+        "-U__CUDA_NO_HALF2_OPERATORS__",
+    ]
 
 # -------------------------------------------------
 # Extensions
@@ -92,10 +109,11 @@ ext_modules = [
 
             "src/ext.cpp",
         ],
+        include_dirs=compat_include_dirs,
         extra_compile_args={
             "cxx": cxx_flags,
             "nvcc": nvcc_flags,
-            
+
         },
     ),
 
@@ -109,20 +127,13 @@ ext_modules = [
             "third_party/cubvh/src/api_gpu.cu",
             "third_party/cubvh/src/bindings.cpp",
         ],
-        include_dirs=[
+        include_dirs=compat_include_dirs + [
             os.path.join(ROOT, "third_party/cubvh/include"),
             os.path.join(ROOT, "third_party/cubvh/third_party/eigen"),
         ],
         extra_compile_args={
             "cxx": cxx_flags,
-            "nvcc": nvcc_flags + [
-                # The following definitions must be undefined
-                # since we need half-precision operation.
-                "--extended-lambda",
-                "-U__CUDA_NO_HALF_OPERATORS__",
-                "-U__CUDA_NO_HALF_CONVERSIONS__",
-                "-U__CUDA_NO_HALF2_OPERATORS__",
-            ],
+            "nvcc": nvcc_flags + cubvh_extra_nvcc_flags,
         },
     ),
 
